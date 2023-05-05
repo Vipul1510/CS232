@@ -1,0 +1,241 @@
+#include "cache.h"
+
+int SCORE_MAX = 31;
+int ROUND_MAX = 100;
+int BAD_SCORE = 1;
+int GUAGE_RATE_MAX = 8191;
+int LLC_RATE_MAx = 255;
+int MSHR_THRES_MAX = 12;
+int LOW_SCORE = 20;
+int BW = 16;
+
+int offset_list[54] = {1,-1,2,-2,3,-3,4,-4,5,-5,6,-6,8,-8,9,-9,10,-10,12,-12,15,-15,16,-16,18,-18,20,-20,24,-24,25,-25,27,-27,30,-30,32,-32,36,-36,40,-40,45,-45,48,-48,50,-50,54,-54,60,-60};
+int rr_table[2][64] = {0};
+int offset
+
+// Implementation of RR Table
+void insert_in_table(long int lineaddr, int bank){
+
+    int hashval = (lineaddr ^ (lineaddr >> 6) ^ (lineaddr >> 12)) & 0x3F;
+    rr_table[bank][hashval] = (((lineaddr>>6) & (4095)))
+
+    return;
+}
+
+void search_in_table(long int lineaddr){
+
+    int hashval = (lineaddr ^ (lineaddr >> 6) ^ (lineaddr >> 12)) & 0x3F;
+
+    if(rr_table[0][hashval] == (((lineaddr>>6) & (4095))) || rr_table[1][hashval] == (((lineaddr>>6) & (4095))) ){
+        return true;
+    }
+    else{
+        return false;
+    }
+}
+
+// Prefetch Throttler
+struct Prefetch_Throttler{
+
+    int prev_inst_l2_miss_cycle;
+    int best_score;
+    int guage_rate;
+    int llc_rate;
+    int mshr_threshold;
+};
+
+struct Prefetch_Throttler pref_trot;
+
+pref_trot.prev_inst_l2_miss_cycle = pref_trot.llc_rate = 0;
+pref_trot.best_score = SCORE_MAX;
+pref_trot.guage_rate = GUAGE_MAX/2;
+pref_trot.mshr_threshold = MSHR_THRES_MAX;
+
+void update_pref_trot(){
+
+    int curr_cycle = (get_current_cycle(0) & 4095);
+    pref_trot.guage_rate += ((curr_cycle - pref_trot.prev_inst_l2_miss_cycle) & 4095) - pref_trot.llc_rate;
+    pref_trot.prev_inst_l2_miss_cycle = curr_cycle;
+
+    if(pref_trot.guage_rate > GUAGE_RATE_MAX){
+
+        if(pref_trot.llc_rate < LLC_RATE_MAX){
+            pref_trot.llc_rate++;
+            
+            update_mshr_thres();
+        }
+        pref_trot.guage_rate = GUAGE_RATE_MAX;
+    }
+    else if(pref_trot.guage_rate < 0){
+        
+        if(pref_trot.llc_rate > 0){
+            pref_trot.llc_rate--;
+
+            update_mshr_thres();
+        }
+        pref_trot.guage_rate = 0;
+    }
+
+}
+
+void update_mshr_thres(){
+
+    if(pref_trot.best_score > LOW_SCORE || pref_trot.llc_rate > (2*BW)){
+        pref_trot.mshr_threshold = MSHR_THRES_MAX;
+    }
+    else if(pref_trot.llc_rate < BW){
+        pref_trot.mshr_threshold = 2;
+    }
+    else{
+        pref_tror.mshr_threshold += 2 + 10*(pref_trot.llc_rate-BW)/BW;
+    }
+}
+
+// Implementation of Delay Queue
+struct Delay_Queue{
+
+    int queue_list[15];
+    int init_cycle[15];   
+    int size;
+};
+
+Delay_Queue DQ;
+
+int i;
+for (i=0; i<15; i++){
+
+    DQ.queue_list[i] = 0;
+    DQ.init_cycle[i] = 0;
+}
+DQ.size = 0;
+
+void DQ_add(long int lineaddr){
+
+    if( DQ.size == 15){
+        insert_in_table(DQ.queue_list[0], 0);
+
+        for(int i=0; i<14; i++){
+            DQ.queue_list[i] = DQ.queue_list[i+1];
+        }
+    }
+    else{
+        size++;
+
+        DQ.queue_list[size] = lineaddr;
+        DQ.init_cycle[size] = (get_current_cyle(0) & 4095);
+    }
+
+    return;
+}
+
+void DQ_remove(){
+
+    if( DQ.size == 0){
+        return;
+    }
+
+    for(int i=0; i<15; i++){
+
+        int curr_cycle = (get_current_cycle(0) & 4095);
+        int tocheck_cycle = DQ.init_cycle[i];
+        int green_cycle = ((tocheck_cycle+60) & 4095);
+
+        int dummy;
+        if(green_cycle > tocheck_cycle){
+            dummy = (curr_cycle >= green_cycle || curr_cycle < tocheck_cycle);
+        }
+        else{
+            dummy = (curr_cycle < tocheck_cycle && curr_cycle >= green_cycle);
+        }
+
+        if(dummy == 1){
+            insert_in_table(DQ.queue_list[i], 0);
+            DQ.size--;
+        }
+        else{
+            for(int j=0; j<DQ.size; j++){
+                DQ.queue_list[j] = DQ.queue_list[i+j];
+            }
+
+            break;
+        }
+    }
+}
+
+// offset score
+int score[54] = {0};
+int best_offset_index = 0;
+int noOfrounds = 0;
+int current_check = 0;
+
+
+void finish_phase(){
+
+    score[54] = {0};
+    best_offset_index = 0;
+    noOfrounds = 0;
+    current_check = 0;
+}
+
+void find_best_offset(long int addr){
+
+    int test = offests[current_check];
+    long int target_addr = addr-test;
+
+    if(search_in_table(target_addr) && ((addr ^ target_addr) >> 6)==0){
+
+        score[current_check]++;
+
+        if(score[current_check] >= score[best_offset_index]){
+            best_offset_index = current_check;
+        }
+    }
+
+    if(current_check == 53){
+        noOfrounds++;
+
+        if(score[best_offset_index] == SCORE_MAX || noOfrounds == ROUND_MAX){
+
+            offset = offset_list[best_offset_index];
+            pref_trot.best_score = score[best_offset_index];
+
+            update_mshr_thres();
+
+            if(score[best_offset_index] <= BAD_SCORE){
+                offset = 0;
+            }
+            
+            finish_phase();
+            return;
+        }
+    }
+
+    current_check = (current_check+1)%54;
+
+}
+
+void CACHE::l2c_prefetcher_initialize() { cout << "CPU " << cpu << " L2C next line prefetcher" << endl; }
+
+int CACHE::l2c_prefetcher_operate(long int addr, long int ip, uint8_t cache_hit, uint8_t type, int metadata_in) {
+    if (type != LOAD)
+        return metadata_in;
+
+    long int pf_addr = ((addr >> LOG2_BLOCK_SIZE) + 1) << LOG2_BLOCK_SIZE;
+
+    DP(if (warmup_complete[cpu]) {
+        cout << "[" << NAME << "] " << _func_ << hex << " base_cl: " << (addr >> LOG2_BLOCK_SIZE);
+        cout << " pf_cl: " << (pf_addr >> LOG2_BLOCK_SIZE) << " ip: " << ip << " cache_hit: " << +cache_hit
+             << " type: " << +type << endl;
+    });
+
+    prefetch_line(ip, addr, pf_addr, FILL_L2, 0);
+
+    return metadata_in;
+}
+
+int CACHE::l2c_prefetcher_cache_fill(
+    long int addr, int set, int way, uint8_t prefetch, long int evicted_addr, int metadata_in) {
+    return metadata_in;
+}
+
+void CACHE::l2c_prefetcher_final_stats() { cout << "CPU " << cpu << " L2C next line prefetcher final stats" << endl; }

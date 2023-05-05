@@ -1,0 +1,307 @@
+#include <iostream>
+#include "cache.h"
+#include <vector>
+using namespace std;
+// RRTableEntry
+#define MAX_SCORE 31
+#define BAD_SCORE 1
+#define MAX_ROUND 100
+
+int hashit(uint64_t x, int nbits)
+{
+  int power_2 = 1;
+  for(int i = 0; i < nbits; i++)
+  {
+    power_2 = 2 * power_2;
+   }
+   power_2--;
+   power_2 = x & power_2;
+   return power_2;
+  
+}
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////RRTABLE////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+class RRTableEntry
+{
+public:
+  uint16_t tag;
+  const int tag_size = 12;
+  const int index_size = 6;
+};
+
+class RRTable
+{
+public:
+  RRTableEntry rrTableleft[64];
+  RRTableEntry rrTableright[64];
+
+  void updateRRTable(uint64_t addr, bool left)
+  {
+    uint16_t index;
+    uint16_t tag = hashit((addr >> 6), 12);
+    if (!left)
+    {
+      index = hashit(addr ^ (addr >> 12), 6);
+      rrTableright[index].tag = tag;
+    }
+    else
+    {
+      index = hashit(addr ^ (addr >> 6), 6);
+      rrTableleft[index].tag = tag;
+    }
+  }
+  bool checkRRtable(uint64_t addr)
+  {
+    uint16_t index1 = hashit(addr ^ (addr >> 6), 6); // xor change can be done
+    uint16_t index2 = hashit(addr ^ (addr >> 12), 6);
+    uint16_t tag = hashit((addr >> 6), 12);
+    return (rrTableleft[index1].tag == tag || rrTableright[index2].tag == tag);
+  }
+};
+
+int offset = 1;
+RRTable RR;
+bool is_prefetch[L2C_SET][L2C_WAY];
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////DELAY QUEUE////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Delay Queue Entry
+class Delay_Queue
+{
+public:
+  vector<uint64_t> addresses;
+  int start;
+  int end;
+  int time[15];
+  bool check[15];
+
+  Delay_Queue()
+  {
+    start = 0;
+    end = 0;
+    for (int item = 0; item < 15; item++)
+    {
+      addresses.push_back(0);
+      time[item] = 0;
+      check[item] = 0;
+    }
+  }
+
+  bool set()
+  {
+    if (!check[start])
+    {
+      return 0;
+    }
+    int temp = hashit(current_core_cycle[0], 12);
+    int i = time[start];
+    int jab = hashit(i + 60, 12);
+
+    if (jab >= i)
+    {
+      return ((temp < i) || (temp >= jab));
+    }
+    else
+    {
+      return ((temp < i) && (temp >= jab));
+    }
+  }
+
+   void add(uint64_t addr)
+  {
+    if (check[end])
+    {
+      RR.updateRRTable(addresses[start], true);
+      start = (start + 1) % 15;
+    }
+    addresses[end] = hashit(addr, 18);
+    check[end] = 1;
+    time[end] = hashit(current_core_cycle[0], 12);
+    end = (end + 1) % 15;
+  }
+int generate(uint64_t addr, int offset)
+{
+  if (offset == 0)
+  {
+    add(addr);
+    return 0;
+  }
+  if ((((addr) ^ (addr + offset)) >> 6) != 0)
+  {
+    return 0;
+  }
+  add(addr);
+  return 1;
+}
+  void remove()
+  {
+    for (int item = 0; item < 15; item++)
+    {
+      if (!set())
+      {
+        break;
+      }
+      check[start] = 0;
+      RR.updateRRTable(addresses[start], true);
+      start = (start + 1) % 15;
+    }
+  }
+};
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////BEST OFFSET PREFECTCHER////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+class BestOffsetPrefetcher
+{
+public:
+  vector<int> offsetList;
+  vector<int> scores;
+  int delayValue;
+  int delayCounter;
+  int highscore;
+  int rounds;
+  int bestoffset;
+  int curr_count;
+
+  BestOffsetPrefetcher()
+  {
+    // rr_table->clear();
+    // delay_queue->clear();
+    // delay_queue_size = 15;
+    curr_count = 0;
+    highscore = 0;
+    bestoffset = 0;
+    rounds = 0;
+    int numbers[46] = {1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8, -8, 9, -9, 10, -10, 11, -11, 12, -12, 13, -13, 14, -14, 15, -15, 16, -16, 18, -18, 20, -20, 24, -24, 30, -30, 32, -32, 36, -36, 40, -40};
+    for (int i = 0; i < 46; i++)
+    {
+      offsetList.push_back(numbers[i]);
+      scores.push_back(0);
+    }
+  }
+
+  void clearscores()
+  {
+    int r = offsetList.size();
+    curr_count = 0;
+    rounds = 0;
+    highscore = 0;
+    bestoffset = 0;
+    for (int i = 0; i < r; i++)
+      scores[i] = 0;
+  }
+  void updatescore(uint64_t addr)
+  {
+    int offsetchecking = offsetList[curr_count];
+    uint64_t testaddress = addr - offsetchecking;
+    if (RR.checkRRtable(testaddress))
+    {
+      scores[curr_count]++;
+      if (scores[curr_count] >= highscore)
+      {
+        highscore = scores[curr_count];
+        bestoffset = offsetchecking;
+      }
+    }
+
+    if (curr_count == 45)
+    {
+      rounds++;
+      if (highscore == MAX_SCORE || rounds == MAX_ROUND)
+      {
+        if (bestoffset != 0)
+        {
+          offset = bestoffset;
+          //cout<<offset<<endl;
+        }
+        else
+        {
+          offset = 1;
+        }
+        if (highscore <= BAD_SCORE)
+        {
+          offset = 0;
+        }
+        //cout<<"Rounds:"<<rounds<<endl;
+        clearscores();
+        return;
+      }
+    }
+    curr_count = (curr_count + 1) % 46;
+  }
+};
+
+BestOffsetPrefetcher B;
+Delay_Queue D;
+
+
+
+void CACHE::l2c_prefetcher_initialize()
+{
+  offset = 1;
+  D = Delay_Queue();
+  B = BestOffsetPrefetcher();
+  for (int i = 0; i < L2C_SET; i++)
+  {
+    for (int j = 0; j < L2C_WAY; j++)
+    {
+      is_prefetch[i][j] = 0;
+    }
+  }
+}
+
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in)
+{
+  /*addr: the memory address being accessed
+ip: the instruction pointer of the code accessing the memory
+cache_hit: a flag indicating whether the memory access hit in the L2 cache
+type: a code indicating the type of memory access (e.g. load, store)
+metadata_in: the metadata associated with the memory access from a previous callback
+*/
+  // In the case of the best-offset prefetcher, the function would update the RR table based on the current memory access, and issue prefetch requests for the memory locations indicated by the best-offset entries in the RR table.
+
+  uint64_t block_number = addr >> 6;
+  uint32_t set = get_set(addr);
+  uint32_t way = get_way(addr, set);
+  int did_prefetch = 0;
+
+  if (cache_hit)
+  {
+    did_prefetch = is_prefetch[set][way];
+    is_prefetch[set][way] = 0;
+  }
+
+  D.remove();
+  int generated = 0;
+    B.updatescore(block_number);
+    generated = D.generate(block_number, offset);
+    if (generated)
+    {
+      prefetch_line(ip, addr, ((addr >> 6) + offset) << 6, FILL_L2, 0);
+    }
+  return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+  uint64_t block_number = addr >> 6;
+  int s = get_set(addr);
+  int w = get_way(addr, s);
+  is_prefetch[s][w] = (prefetch > 0);
+
+  uint64_t testaddress;
+  if ((prefetch > 0) || (offset == 0))
+  {
+    testaddress = block_number - offset;
+    //if ((addr ^ (testaddress >> 6)) != 0)
+      RR.updateRRTable(testaddress, false);
+  }
+  return metadata_in;
+}
+
+void CACHE::l2c_prefetcher_final_stats()
+{
+}
